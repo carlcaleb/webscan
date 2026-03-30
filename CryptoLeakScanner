@@ -1,0 +1,523 @@
+# File: CryptoLeakScanner.py
+import os
+import re
+import json
+import time
+import base64
+import random
+import requests
+import argparse
+import csv
+from datetime import datetime
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
+
+# Optional modules
+try:
+    from eth_keyfile import decode_keyfile_json
+except ImportError:
+    print("[!] Warning: 'eth-keyfile' not installed. Ethereum keystore decryption will be skipped.")
+
+try:
+    from asn1crypto import pem, x509, keys
+except ImportError:
+    print("[!] Warning: 'asn1crypto' not installed. PEM/DER validation will be skipped.")
+
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.prounds(0.5, 1.5)
+
+# ========================
+# Chain Detection
+# ========================
+def detect_chain(address):
+    address = address.strip()
+    if re.match(r"^0x[a-fA-F0-9]{40}$", address): return "ethereum"
+    elif re.match(r"^(1|3)[a-km-zA-HJ-NP-Z0-9]{25,34}$", address): return "bitcoin"
+    elif re.match(r"^bc1[ac-hj-np-z02-9]{6,86}$", address): return "bitcoin-segwit"
+    elif re.match(r"^[1-9A-HJ-NP-Za-km-z]{44}$", address): return "solana"
+    elif re.match(r"^4[0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$", address): return "monero"
+    elif re.match(r"^addr1[0-9a-zA-Z]{54,64}$", address): return "cardano"
+    elif re.match(r"^(L|M)[a-km-zA-HJ-NP-Z1-9]{25,34}$", address): return "litecoin"
+    elif re.match(r"^D{1}[5-9A-HJ-NP-U][1-9A-HJ-NP-Za-km-z]{32,33}$", address): return "dogecoin"
+    return "unknown"
+
+# ========================
+# Seed Phrase Detection
+# ========================
+BIP39_WORDS = {
+    "abandon", "ability", "able", "about", "above", "absent", "academy", "accelerate", "account",
+    "accuse", "achieve", "acid", "acoustic", "acquire", "across", "action", "actor", "actress", "actual", "adapt"
+}
+
+def contains_seed_phrase(html):
+    candidates = []
+    words = re.findall(r'\b(?:' + '|'.join(BIP39_WORDS) + r')\b', html, re.IGNORECASE)
+    i = 0
+    while i < len(words):
+        phrase = []
+        count = 0
+        j = i
+        while j < len(words) and count < 24:
+            word = words[j].lower()
+            if word in BIP39_WORDS:
+                phrase.append(word)
+                count += 1
+            else:
+                break
+            j += 1
+        if count >= 12:
+            candidates.append(" ".join(phrase))
+        i = j + 1 if j == i else j
+    return candidates
+
+# ========================
+# Scan Content for Secrets
+# ========================
+def scan_content_for_secrets(html, base_url):
+    results = []
+
+    for name, pattern in CRYPTO_PATTERNS.items():
+        matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
+        for match in matches:
+            match = str(match).strip()
+            entry_key = (name, match, base_url)
+            if entry_key in SEEN_ENTRIES:
+                continue
+            SEEN_ENTRIES.add(entry_key)
+
+            result = {
+                "type": name,
+                "match": match,
+                "url": base_url,
+                "chain": detect_chain(match),
+                "valid": False
+            }
+
+            if name == "Private Key (Hex)" or name == "Private Key (WIF)":
+                result["valid"] = is_valid_ecdsa_private_key(match)
+            elif name == "Ethereum Address":
+                result["valid"] = is_valid_secp256k1_pubkey(match)
+            elif name == "X.509 Certificate":
+                cert_info = parse_x509_certificate(match)
+                result.update(cert_info)
+                result["valid"] = cert_info.get("valid", False)
+            elif name == "Seed Phrase Candidate":
+                result["valid"] = True
+
+            ALL_RESULTS.append(result)
+
+# ========================
+# ASN.1 DER Decoder (Full Version)
+# ========================
+class Stream:
+    def __init__(self, data: Union[str, bytes]):
+        if isinstance(data, str):
+            self.hex_data = data
+            self.pos = 0
+        else:
+            self.hex_data = data.hex()
+            self.pos = 0
+
+    def get(self) -> int:
+        val = int(self.hex_data[self.pos:self.pos+2], 16)
+        self.pos += 2
+        return val
+
+    def hexDump(self, start, end, raw=False):
+        hd = self.hex_data[start:end]
+        if raw:
+            return hd
+        return ' '.join(hd[i:i+2] for i in range(0, len(hd), 2))
+
+    def pos(self):
+        return self.pos
+
+
+class ASN1Tag:
+    def __init__(self, stream: Stream):
+        self.stream = stream
+        self.tagByte = stream.get()
+        self.tagClass = self.tagByte & 0xC0
+        self.tagConstructed = (self.tagByte & 0x20) != 0
+        self.tagNumber = self.tagByte & 0x1F
+
+    def isEOC(self):
+        return self.tagClass == 0x00 and self.tagNumber == 0x00
+
+    def typeName(self):
+        if self.tagClass == 0x00:
+            if self.tagNumber == 0x01:
+                return "BOOLEAN"
+            elif self.tagNumber == 0x02:
+                return "INTEGER"
+            elif self.tagNumber == 0x03:
+                return "BITSTRING"
+            elif self.tagNumber == 0x04:
+                return "OCTETSTRING"
+            elif self.tagNumber == 0x05:
+                return "NULL"
+            elif self.tagNumber == 0x06:
+                return "OBJECTID"
+            elif self.tagNumber == 0x0A:
+                return "ENUMERATED"
+            elif self.tagNumber == 0x17:
+                return "UTCTime"
+            elif self.tagNumber == 0x18:
+                return "GeneralizedTime"
+            elif self.tagNumber == 0x30 and self.tagConstructed:
+                return "SEQUENCE"
+            elif self.tagNumber == 0x31 and self.tagConstructed:
+                return "SET"
+        return f"Universal_{self.tagNumber}"
+
+
+class ASN1:
+    def __init__(self, stream: Stream):
+        self.stream = stream
+        self.header = stream.pos
+        self.tag = ASN1Tag(stream)
+        self.length = self.decode_length(stream)
+        self.sub = None
+        if self.tag.tagConstructed and self.length is not None:
+            self.sub = []
+            end = stream.pos + self.length
+            while stream.pos < end:
+                self.sub.append(ASN1(stream))
+        elif self.tag.tagNumber == 0x02:  # INTEGER
+            self.value = self.decode_integer(stream, self.length)
+        elif self.tag.tagNumber == 0x03:  # BIT STRING
+            unused = stream.get()
+            length = self.length - 1
+            bits = ''.join(f"{stream.get():08b}" for _ in range(length))
+            self.value = bits[:unused]
+        elif self.tag.tagNumber == 0x04:  # OCTET STRING
+            self.value = stream.hexDump(stream.pos, stream.pos + self.length, raw=True)
+        elif self.tag.tagNumber == 0x05:  # NULL
+            self.value = None
+        elif self.tag.tagNumber == 0x06:  # OBJECT ID
+            self.value = self.decode_oid(stream, self.length)
+        elif self.tag.tagNumber == 0x17:  # UTCTime
+            utc_time = stream.hexDump(stream.pos, stream.pos + self.length, raw=True)
+            self.value = bytes.fromhex(utc_time).decode('ascii')
+        elif self.tag.tagNumber == 0x18:  # GeneralizedTime
+            gtime = stream.hexDump(stream.pos, stream.pos + self.length, raw=True)
+            self.value = bytes.fromhex(gtime).decode('ascii')
+        elif self.tag.isEOC():
+            pass
+
+    @staticmethod
+    def decode_length(stream: Stream):
+        first = stream.get()
+        if first & 0x80:
+            num_bytes = first & 0x7F
+            if num_bytes > 8:
+                raise ValueError("Length too long")
+            length = 0
+            for _ in range(num_bytes):
+                length = (length << 8) + stream.get()
+            return length
+        else:
+            return first
+
+    @staticmethod
+    def decode_integer(stream: Stream, length: int):
+        val = ''
+        for _ in range(length):
+            val += f"{stream.get():02x}"
+        return val
+
+    @staticmethod
+    def decode_oid(stream: Stream, length: int):
+        oid = [str(stream.get() // 40) + "." + str(stream.get() % 40)]
+        val = 0
+        for _ in range(stream.pos, stream.pos + length):
+            b = stream.get()
+            val = ((val << 7) | (b & 0x7F))
+            if not (b & 0x80):
+                oid.append(str(val))
+                val = 0
+        return '.'.join(oid)
+
+    def content(self, max_len=100):
+        if self.tag.tagNumber == 0x02:
+            return self.value
+        elif self.tag.typeName() == "SEQUENCE":
+            return [child.content() for child in self.sub]
+        return ""
+
+    def toPrettyString(self, indent=""):
+        tag_name = self.tag.typeName()
+        s = f"{indent}{tag_name} @{self.stream.pos - 2}\n"
+        if self.length is not None:
+            s += f"{indent}  Length: {self.length}\n"
+        if self.tag.tagConstructed and self.sub:
+            s += f"{indent}  Sub:\n"
+            for child in self.sub:
+                s += child.toPrettyString(indent + "    ")
+        return s
+
+    def getHexStringValue(self):
+        return self.stream.hexDump(self.stream.posStart(), self.stream.posEnd(), raw=True)
+
+
+# ========================
+# ASN.1 DER Parser Function
+# ========================
+def parse_asn1_der(hex_data):
+    try:
+        stream = Stream(hex_data)
+        return ASN1(stream)
+    except Exception as e:
+        print(f"[!] ASN.1 decoding failed: {e}")
+        return None
+
+# ========================
+# Ethereum Keystore Decryption
+# ========================
+def decrypt_ethereum_keystore(path, passphrase=""):
+    try:
+        with open(path, 'r') as f:
+            key_data = json.load(f)
+        private_key = decode_keyfile_json(key_data, passphrase.encode())
+        return private_key.hex()
+    except Exception as e:
+        return None
+
+# ========================
+# ECDSA Key Validation
+# ========================
+def is_valid_secp256k1_pubkey(pubkey_hex):
+    if pubkey_hex.startswith("0x"):
+        pubkey_hex = pubkey_hex[2:]
+    if not re.match(r"^[a-fA-F0-9]{64}$", pubkey_hex):
+        return False
+    return True
+
+def is_valid_ecdsa_private_key(key_str):
+    try:
+        if re.match(r"[a-fA-F0-9]{64}", key_str):
+            return True
+        elif re.match(r"5[HJK][1-9A-Za-z][^OIl]{48,52}|L[A-Za-z0-9]{51}|K[A-Za-z0-9]{51}", key_str):
+            return True
+        return False
+    except:
+        return False
+
+# ========================
+# AES-GCM Encryption Vault
+# ========================
+def encrypt_private_key(password: str, private_key: bytes):
+    salt = os.urandom(16)
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000)
+    key = kdf.derive(password.encode())
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, private_key, None)
+    return {
+        "salt": base64.b64encode(salt).decode(),
+        "nonce": base64.b64encode(nonce).decode(),
+        "ciphertext": base64.b64encode(ciphertext).decode()
+    }
+
+def save_to_vault(data):
+    try:
+        if os.path.exists(KEY_VAULT_PATH):
+            with open(KEY_VAULT_PATH, 'r') as f:
+                vault = json.load(f)
+        else:
+            vault = {"entries": []}
+        vault["entries"].append(data)
+        with open(KEY_VAULT_PATH, 'w') as f:
+            json.dump(vault, f, indent=2)
+    except Exception as e:
+        print(f"[!] Vault write error: {e}")
+
+# ========================
+# Website Crawling Logic
+# ========================
+def fetch_page(url):
+    try:
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return response.text
+        print(f"[!] Failed to fetch {url} - Status: {response.status_code}")
+    except Exception as e:
+        print(f"[!] Error fetching {url}: {e}")
+    return ""
+
+def extract_links(html, base_url):
+    links = set()
+    soup = BeautifulSoup(html, 'html.parser')
+    for a_tag in soup.find_all("a", href=True):
+        full_url = urljoin(base_url, a_tag["href"])
+        parsed = urlparse(full_url)
+        if parsed.scheme in ["http", "https"]:
+            links.add(full_url)
+    return links
+
+def crawl_website(start_url, max_depth=MAX_DEPTH):
+    queue = [(start_url, 0)]
+    while queue:
+        url, depth = queue.pop(0)
+        if url in VISITED_URLS or depth > MAX_DEPTH:
+            continue
+        print(f"[*] Crawling: {url}")
+        html = fetch_page(url)
+        if html:
+            secrets = scan_content_for_secrets(html, url)
+            for result in secrets:
+                if "-----BEGIN PRIVATE KEY-----" in result["match"]:
+                    result["valid"] = is_valid_pem_private_key(result["match"])
+                ALL_RESULTS.append(result)
+        links = extract_links(html, start_url)
+        for link in links:
+            if link not in VISITED_URLS:
+                queue.append((link, depth + 1))
+        VISITED_URLS.add(url)
+        time.sleep(random.uniform(0.5, 1.5))
+
+# ========================
+# Parse PEM Certificates
+# ========================
+def is_valid_pem_private_key(pem_data):
+    try:
+        if pem.detect(pem_data):
+            _, _, der_bytes = pem.unarmor(pem_data)
+            keys.PrivateKeyInfo.load(der_bytes)
+            return True
+    except Exception as e:
+        return False
+    return False
+
+def parse_x509_certificate(cert_data):
+    try:
+        if pem.detect(cert_data):
+            _, _, der_bytes = pem.unarmor(cert_data)
+            cert = x509.Certificate.load(der_bytes)
+            pub_key = cert["tbs_certificate"]["subject_public_key_info"]
+            return {
+                "valid": True,
+                "issuer": cert["tbs_certificate"]["issuer"].human_friendly,
+                "subject": cert["tbs_certificate"]["subject"].human_friendly,
+                "pub_key_hex": pub_key.native['public_key'].hex(),
+                "not_before": cert["tbs_certificate"]["validity"]["not_before"].native,
+                "not_after": cert["tbs_certificate"]["validity"]["not_after"].native
+            }
+        else:
+            return {"valid": False}
+    except Exception as e:
+        return {"valid": False}
+
+# ========================
+# Check Balance on Blockchain
+# ========================
+def has_balance_on_blockchain(address, chain):
+    try:
+        if chain == "ethereum":
+            url = f"https://api.etherscan.io/api?module=account&action=balance&address= {address}&apikey={ETHERSCAN_API_KEY}"
+            resp = requests.get(url)
+            data = resp.json()
+            return int(data['result']) > 0
+        elif chain == "bitcoin":
+            url = f"https://blockchair.com/bitcoin/address/ {address}/json"
+            resp = requests.get(url)
+            data = resp.json()
+            return data.get('context', {}).get('balance', 0) > 0
+        return True  # Default: assume valid if balance check not supported
+    except:
+        return False
+
+# ========================
+# Export Results to CSV
+# ========================
+def export_to_desktop_csv(results):
+    desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"crypto_leaks_{timestamp}.csv"
+    filepath = os.path.join(desktop_path, filename)
+
+    fieldnames = ["type", "match", "url", "chain", "valid"]
+    try:
+        with open(filepath, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            for result in results:
+                match = result.get("match", "")
+                chain = result.get("chain", "N/A")
+                is_valid = result.get("valid", False)
+
+                if is_valid and has_balance_on_blockchain(match, chain):
+                    writer.writerow({
+                        "type": result.get("type", ""),
+                        "match": match[:32767],
+                        "url": result.get("url", ""),
+                        "chain": chain,
+                        "valid": is_valid
+                    })
+        print(f"[+] Results exported to: {filepath}")
+    except Exception as e:
+        print(f"[!] Error exporting to CSV: {e}")
+
+# ========================
+# Ethereum Keystore Scanner
+# ========================
+def scan_for_ethereum_keystores(html, base_url):
+    matches = re.findall(r"UTC--[0-9T\-]+--.*\.json", html)
+    for filename in matches:
+        full_url = urljoin(base_url, filename)
+        try:
+            response = requests.get(full_url)
+            if response.status_code == 200:
+                try:
+                    key_data = response.json()
+                    private_key_hex = decode_keyfile_json(key_data, b"")  # Try empty password
+                    if private_key_hex:
+                        print(f"[+] Found Ethereum keystore: {full_url}")
+                        encrypted = encrypt_private_key(DEFAULT_PASSWORD, private_key_hex)
+                        save_to_vault({
+                            "type": "ethereum-keystore",
+                            "source": full_url,
+                            "encrypted": encrypted
+                        })
+                except Exception as e:
+                    print(f"[!] Not valid Ethereum keystore: {full_url}")
+        except:
+            pass
+
+# ========================
+# Graceful Exit Handling
+# ========================
+def graceful_exit(signal_received, frame):
+    print("\n[!] Scan interrupted. Saving final findings...")
+    if ALL_RESULTS:
+        export_to_desktop_csv(ALL_RESULTS)
+    else:
+        print("[*] No findings to export.")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, graceful_exit)
+signal.signal(signal.SIGTERM, graceful_exit)
+
+# ========================
+# Main Entry Point
+# ========================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Crypto Leak Scanner with ASN.1 Decode")
+    parser.add_argument("target", help="Target URL to scan")
+    parser.add_argument("--depth", type=int, default=2, help="Crawl depth (default: 2)")
+    args = parser.parse_args()
+
+    TARGET_DOMAIN = urlparse(args.target).netloc
+
+    print("[*] Starting scan...")
+    crawl_website(args.target, args.depth)
+
+    print("[*] Checking for Ethereum keystores...")
+    for result in ALL_RESULTS:
+        if result["type"] == "Ethereum Keystore JSON":
+            scan_for_ethereum_keystores(result["match"], result["url"])
+
+    print("[*] Final saving of findings...")
+    export_to_desktop_csv(ALL_RESULTS)
+    print("[✓] Scan complete. Check your desktop.")
